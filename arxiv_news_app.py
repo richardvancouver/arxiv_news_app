@@ -71,17 +71,140 @@ class Translator:
                 self.google_translator = None
         return self.google_translator
     
+    def translate_with_baidu(self, text: str, src: str = "en", dest: str = "zh") -> str:
+        """使用百度翻译API进行翻译。"""
+        try:
+            import hashlib
+            import random
+            import requests
+            
+            # 获取百度翻译配置
+            app_id = CONFIG["translation"]["baidu"]["app_id"]
+            app_key = CONFIG["translation"]["baidu"]["app_key"]
+            
+            # 检查API密钥
+            if not app_id or not app_key:
+                logger.error("百度翻译API密钥未配置")
+                return text
+            
+            # 构建请求参数
+            url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+            salt = str(random.randint(32768, 65536))
+            sign = app_id + text + salt + app_key
+            sign = hashlib.md5(sign.encode()).hexdigest()
+            
+            params = {
+                "q": text,
+                "from": src,
+                "to": dest,
+                "appid": app_id,
+                "salt": salt,
+                "sign": sign
+            }
+            
+            # 发送请求
+            response = requests.get(url, params=params)
+            result = response.json()
+            
+            # 处理响应
+            if "trans_result" in result:
+                return result["trans_result"][0]["dst"]
+            else:
+                error_msg = result.get("error_msg", "未知错误")
+                logger.error(f"百度翻译失败: {error_msg}")
+                return text
+        except ImportError:
+            logger.error("缺少requests库，无法使用百度翻译")
+            return text
+        except Exception as e:
+            logger.error(f"百度翻译异常: {e}")
+            return text
+    
+    def translate_with_doubao(self, text: str, src: str = "en", dest: str = "zh") -> str:
+        """使用豆包翻译API进行翻译。"""
+        try:
+            import requests
+            import time
+            import hmac
+            import hashlib
+            
+            # 获取豆包翻译配置
+            api_key = CONFIG["translation"]["doubao"]["api_key"]
+            secret_key = CONFIG["translation"]["doubao"]["secret_key"]
+            
+            # 检查API密钥
+            if not api_key or not secret_key:
+                logger.error("豆包翻译API密钥未配置")
+                return text
+            
+            # 构建请求参数
+            url = "https://ark.cn-beijing.volces.com/api/v3/translate"
+            timestamp = str(int(time.time()))
+            
+            # 生成签名
+            string_to_sign = f"{timestamp}\n{api_key}"
+            signature = hmac.new(secret_key.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
+            
+            # 设置请求头
+            headers = {
+                "Content-Type": "application/json",
+                "X-Volcengine-Timestamp": timestamp,
+                "X-Volcengine-Access-Key": api_key,
+                "X-Volcengine-Signature": signature
+            }
+            
+            # 构建请求体
+            payload = {
+                "TextList": [text],
+                "SourceLanguage": src,
+                "TargetLanguage": dest
+            }
+            
+            # 发送请求
+            response = requests.post(url, json=payload, headers=headers)
+            result = response.json()
+            
+            # 处理响应
+            if "TranslationList" in result and result["TranslationList"]:
+                return result["TranslationList"][0]["Translation"]
+            else:
+                error_msg = result.get("Message", "未知错误")
+                logger.error(f"豆包翻译失败: {error_msg}")
+                return text
+        except ImportError:
+            logger.error("缺少requests库，无法使用豆包翻译")
+            return text
+        except Exception as e:
+            logger.error(f"豆包翻译异常: {e}")
+            return text
+    
     def translate(self, text: str, src: str = "en", dest: str = "zh-cn") -> str:
         """将文本从源语言翻译成目标语言。"""
         try:
-            # 默认使用Google翻译
-            translator = self.get_google_translator()
-            if translator:
-                result = translator.translate(text, src=src, dest=dest)
-                return result.text
-            
-            logger.warning("所有翻译器均不可用，返回原文")
-            return text
+            # 根据配置选择翻译服务
+            if self.translator_type == "baidu":
+                return self.translate_with_baidu(text, src, "zh")
+            elif self.translator_type == "doubao":
+                return self.translate_with_doubao(text, src, "zh")
+            else:  # 默认使用Google翻译
+                translator = self.get_google_translator()
+                if translator:
+                    result = translator.translate(text, src=src, dest=dest)
+                    return result.text
+                
+                # Google翻译失败，尝试其他服务
+                logger.warning("Google翻译不可用，尝试百度翻译")
+                baidu_result = self.translate_with_baidu(text, src, "zh")
+                if baidu_result != text:
+                    return baidu_result
+                
+                logger.warning("百度翻译不可用，尝试豆包翻译")
+                doubao_result = self.translate_with_doubao(text, src, "zh")
+                if doubao_result != text:
+                    return doubao_result
+                
+                logger.warning("所有翻译器均不可用，返回原文")
+                return text
         except Exception as e:
             logger.error(f"翻译失败: {e}")
             return text
@@ -111,6 +234,8 @@ class ArxivNewsApp:
         self.current_paper_index = 0
         self.is_playing = False
         self.favorites = []
+        self.pregenerated_speech = {}  # 存储预生成的语音文件路径
+        self.speech_generating = {}  # 标记哪些论文正在生成语音
         
         # 加载收藏列表
         self.load_favorites()
@@ -127,6 +252,9 @@ class ArxivNewsApp:
         
         # 将程序添加到Windows自动运行列表
         self.add_to_auto_start()
+        
+        # 注册窗口关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         
     def setup_styles(self):
         """配置ttk样式，使其更加现代和卡通化。"""
@@ -433,9 +561,51 @@ class ArxivNewsApp:
         # 下一篇按钮
         def next_paper():
             """下一篇论文处理函数。"""
-            self.current_paper_index += 1
-            play_window.destroy()
-            self.play_next_paper()
+            next_index = self.current_paper_index + 1
+            
+            # 检查下一篇论文是否存在
+            if next_index >= len(self.current_papers):
+                messagebox.showinfo("提示", "已经是最后一篇论文了")
+                return
+            
+            # 检查下一篇论文的语音是否正在生成
+            if next_index in self.speech_generating and self.speech_generating[next_index]:
+                # 显示等待提示
+                wait_window = tk.Toplevel(play_window)
+                wait_window.title("⏳ 等待")
+                wait_window.geometry("300x150")
+                wait_window.configure(bg="#f0f8ff")
+                wait_window.attributes("-topmost", True)
+                
+                # 创建等待标签
+                wait_label = ttk.Label(wait_window, text="🎵 正在生成下一篇语音...", font=("Arial", 12, "bold"), foreground="#4a90e2")
+                wait_label.pack(pady=30)
+                
+                # 创建取消按钮
+                def cancel_wait():
+                    wait_window.destroy()
+                
+                cancel_btn = ttk.Button(wait_window, text="❌ 取消", command=cancel_wait)
+                cancel_btn.pack(pady=10)
+                
+                # 定期检查语音生成状态
+                def check_speech_status():
+                    if next_index not in self.speech_generating or not self.speech_generating[next_index]:
+                        wait_window.destroy()
+                        # 语音生成完成，播放下一篇
+                        self.current_paper_index += 1
+                        play_window.destroy()
+                        self.play_next_paper()
+                    else:
+                        # 继续检查
+                        wait_window.after(500, check_speech_status)
+                
+                check_speech_status()
+            else:
+                # 语音已经生成，直接播放下一篇
+                self.current_paper_index += 1
+                play_window.destroy()
+                self.play_next_paper()
         
         next_btn = ttk.Button(control_frame, text="⏭️ 下一篇", command=next_paper)
         next_btn.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
@@ -514,40 +684,111 @@ class ArxivNewsApp:
     def fill_config_frame(self):
         """填充配置页面内容，添加卡通元素和丰富的颜色。"""
         # 添加卡通装饰
-        decor_label = ttk.Label(self.config_frame, text="⚙️ 配置中心", font=("Arial", 16, "bold"), foreground="#4a90e2")
+        decor_label = ttk.Label(self.config_frame, text="⚙️ 配置中心", font=(
+            "Arial", 16, "bold"), foreground="#4a90e2")
         decor_label.pack(pady=20)
         
-        # 创建配置项
-        config_frame = ttk.LabelFrame(self.config_frame, text="🔍 搜索配置", style="Decorative.TLabelframe")
-        config_frame.pack(fill=tk.X, padx=20, pady=10)
+        # 创建搜索配置项
+        search_frame = ttk.LabelFrame(self.config_frame, text="🔍 搜索配置", style="Decorative.TLabelframe")
+        search_frame.pack(fill=tk.X, padx=20, pady=10)
         
         # 关键词配置
-        keyword_label = ttk.Label(config_frame, text="💡 关键词：", font=("Arial", 11, "bold"))
+        keyword_label = ttk.Label(search_frame, text="💡 关键词：", font=("Arial", 11, "bold"))
         keyword_label.pack(padx=10, pady=5, anchor=tk.W)
         
-        keyword_desc = ttk.Label(config_frame, text="多个关键词用逗号分隔，例如：pulsar, fast radio burst, neutron star", 
+        keyword_desc = ttk.Label(search_frame, text="多个关键词用逗号分隔，例如：pulsar, fast radio burst, neutron star", 
                                font=("Arial", 10, "italic"), foreground="#666666")
         keyword_desc.pack(padx=10, pady=2, anchor=tk.W)
         
-        self.keyword_entry = ttk.Entry(config_frame, width=60, font=("Arial", 11))
+        self.keyword_entry = ttk.Entry(search_frame, width=60, font=("Arial", 11))
         self.keyword_entry.insert(0, ", ".join(CONFIG["keywords"]))
         self.keyword_entry.pack(padx=10, pady=5, anchor=tk.W)
         
         # 领域配置
-        field_label = ttk.Label(config_frame, text="🌌 领域：", font=("Arial", 11, "bold"))
+        field_label = ttk.Label(search_frame, text="🌌 领域：", font=("Arial", 11, "bold"))
         field_label.pack(padx=10, pady=15, anchor=tk.W)
         
-        field_desc = ttk.Label(config_frame, text="多个领域用逗号分隔，例如：physics, astro-ph", 
+        field_desc = ttk.Label(search_frame, text="多个领域用逗号分隔，例如：physics, astro-ph", 
                              font=("Arial", 10, "italic"), foreground="#666666")
         field_desc.pack(padx=10, pady=2, anchor=tk.W)
         
-        self.field_entry = ttk.Entry(config_frame, width=60, font=("Arial", 11))
+        self.field_entry = ttk.Entry(search_frame, width=60, font=("Arial", 11))
         self.field_entry.insert(0, ", ".join(CONFIG["fields"]))
         self.field_entry.pack(padx=10, pady=5, anchor=tk.W)
         
+        # 创建翻译配置项
+        translate_frame = ttk.LabelFrame(self.config_frame, text="🌐 翻译配置", style="Decorative.TLabelframe")
+        translate_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        # 翻译服务选择
+        service_label = ttk.Label(translate_frame, text="🔤 翻译服务：", font=("Arial", 11, "bold"))
+        service_label.pack(padx=10, pady=5, anchor=tk.W)
+        
+        self.translator_var = tk.StringVar(value=CONFIG["translation"]["type"])
+        service_combobox = ttk.Combobox(translate_frame, textvariable=self.translator_var, 
+                                        values=["google", "baidu", "doubao"], width=57, font=("Arial", 11))
+        service_combobox.pack(padx=10, pady=5, anchor=tk.W)
+        
+        # 百度翻译配置
+        baidu_frame = ttk.LabelFrame(translate_frame, text="🔹 百度翻译API", style="Decorative.TLabelframe")
+        baidu_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # 百度App ID
+        baidu_id_label = ttk.Label(baidu_frame, text="📋 App ID：", font=("Arial", 10, "bold"))
+        baidu_id_label.pack(padx=10, pady=5, anchor=tk.W)
+        
+        self.baidu_app_id_entry = ttk.Entry(baidu_frame, width=55, font=("Arial", 10))
+        self.baidu_app_id_entry.insert(0, CONFIG["translation"]["baidu"]["app_id"])
+        self.baidu_app_id_entry.pack(padx=10, pady=2, anchor=tk.W)
+        
+        # 百度App Key
+        baidu_key_label = ttk.Label(baidu_frame, text="🔑 App Key：", font=("Arial", 10, "bold"))
+        baidu_key_label.pack(padx=10, pady=10, anchor=tk.W)
+        
+        self.baidu_app_key_entry = ttk.Entry(baidu_frame, width=55, font=("Arial", 10))
+        self.baidu_app_key_entry.insert(0, CONFIG["translation"]["baidu"]["app_key"])
+        self.baidu_app_key_entry.pack(padx=10, pady=2, anchor=tk.W)
+        
+        # 豆包翻译配置
+        doubao_frame = ttk.LabelFrame(translate_frame, text="🔹 豆包翻译API", style="Decorative.TLabelframe")
+        doubao_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # 豆包API Key
+        doubao_key_label = ttk.Label(doubao_frame, text="📋 API Key：", font=("Arial", 10, "bold"))
+        doubao_key_label.pack(padx=10, pady=5, anchor=tk.W)
+        
+        self.doubao_api_key_entry = ttk.Entry(doubao_frame, width=55, font=("Arial", 10))
+        self.doubao_api_key_entry.insert(0, CONFIG["translation"]["doubao"]["api_key"])
+        self.doubao_api_key_entry.pack(padx=10, pady=2, anchor=tk.W)
+        
+        # 豆包Secret Key
+        doubao_secret_label = ttk.Label(doubao_frame, text="🔑 Secret Key：", font=("Arial", 10, "bold"))
+        doubao_secret_label.pack(padx=10, pady=10, anchor=tk.W)
+        
+        self.doubao_secret_key_entry = ttk.Entry(doubao_frame, width=55, font=("Arial", 10))
+        self.doubao_secret_key_entry.insert(0, CONFIG["translation"]["doubao"]["secret_key"])
+        self.doubao_secret_key_entry.pack(padx=10, pady=2, anchor=tk.W)
+        
         # 保存按钮
-        save_btn = ttk.Button(config_frame, text="💾 保存配置", command=self.save_config, style="TButton")
+        save_btn = ttk.Button(translate_frame, text="💾 保存配置", command=self.save_config, style="TButton")
         save_btn.pack(padx=10, pady=20, anchor=tk.W)
+        
+        # 自动运行设置
+        auto_start_frame = ttk.LabelFrame(self.config_frame, text="🚀 自动运行设置", style="Decorative.TLabelframe")
+        auto_start_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        # 检查当前自动运行状态
+        self.auto_start_var = tk.BooleanVar(value=self.is_in_auto_start())
+        
+        # 创建自动运行复选框
+        auto_start_check = ttk.Checkbutton(auto_start_frame, text="✅ 开机自动启动", variable=self.auto_start_var, 
+                                          command=self.toggle_auto_start)
+        auto_start_check.pack(padx=10, pady=15, anchor=tk.W)
+        
+        # 系统类型提示
+        os_type = "Windows" if os.name == 'nt' else "Linux" if os.name == 'posix' else "其他"
+        os_label = ttk.Label(auto_start_frame, text=f"💻 当前系统：{os_type}", font=("Arial", 10, "italic"), foreground="#666666")
+        os_label.pack(padx=10, pady=5, anchor=tk.W)
         
         # 添加卡通提示
         tip_label = ttk.Label(self.config_frame, text="💡 提示：配置保存后会立即生效，无需重启程序！", 
@@ -645,14 +886,85 @@ class ArxivNewsApp:
         thread.start()
         
     def play_latest_papers(self):
-        """播放最新论文。"""
+        """播放最新论文，立即开始播放第一篇，后台预生成其他语音文件。"""
         if not self.current_papers:
             messagebox.showinfo("提示", "没有找到新论文，请先检查新论文")
             return
         
         self.is_playing = True
         self.current_paper_index = 0
+        
+        # 清理之前的预生成文件
+        if hasattr(self, 'pregenerated_speech'):
+            for speech_path in self.pregenerated_speech.values():
+                if os.path.exists(speech_path):
+                    os.unlink(speech_path)
+        
+        self.pregenerated_speech = {}
+        self.speech_generating = {}
+        
+        # 立即开始播放第一篇论文
+        self.status_label.config(text="▶️ 开始播放论文...")
         self.play_next_paper()
+        
+        # 后台预生成其他论文的语音文件
+        def pregenerate_speech():
+            for i, paper in enumerate(self.current_papers):
+                # 跳过第一篇，已经开始播放
+                if i == 0:
+                    continue
+                
+                # 标记该论文正在生成语音
+                self.speech_generating[i] = True
+                
+                # 清理LaTeX数学标识符
+                title = re.sub(r'\$.*?\$', '', paper["title"])
+                abstract = re.sub(r'\$.*?\$', '', paper["abstract"])
+                
+                # 翻译标题和摘要
+                translated_title = translator.translate(title)
+                translated_abstract = translator.translate(abstract)
+                
+                # 构建总结
+                summary = f"{translated_title}：{translated_abstract}"
+                
+                # 生成语音文件
+                import tempfile
+                temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, mode='wb')
+                temp_file_path = temp_file.name
+                temp_file.close()
+                
+                logger.info(f"预生成语音文件 {i+1}/{len(self.current_papers)}: {temp_file_path}")
+                
+                # 使用edge-tts生成语音
+                import subprocess
+                import sys
+                
+                # 转义命令中的特殊字符
+                escaped_summary = summary.replace('"', '\\"').replace("'", "\\'")
+                escaped_temp_path = temp_file_path.replace('\\', '\\\\')
+                
+                # 构建edge-tts命令
+                cmd = [
+                    sys.executable, "-c",
+                    f"import edge_tts; import asyncio; asyncio.run(edge_tts.Communicate('{escaped_summary}', 'zh-CN-XiaoxiaoNeural').save('{escaped_temp_path}'))"
+                ]
+                
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    self.pregenerated_speech[i] = temp_file_path
+                except Exception as e:
+                    logger.error(f"预生成语音文件失败: {e}")
+                    if os.path.exists(temp_file_path):
+                        os.unlink(temp_file_path)
+                finally:
+                    # 标记该论文语音生成完成
+                    if i in self.speech_generating:
+                        del self.speech_generating[i]
+        
+        # 在新线程中预生成语音
+        thread = threading.Thread(target=pregenerate_speech)
+        thread.start()
         
     def play_next_paper(self):
         """播放下一篇论文。"""
@@ -672,63 +984,80 @@ class ArxivNewsApp:
         self.status_label.config(text="播放已停止")
         
     def play_paper_speech(self, paper):
-        """播放论文语音。"""
-        # 清理LaTeX数学标识符
-        title = re.sub(r'\$.*?\$', '', paper["title"])
-        abstract = re.sub(r'\$.*?\$', '', paper["abstract"])
-        
-        # 翻译标题和摘要
-        translated_title = translator.translate(title)
-        translated_abstract = translator.translate(abstract)
-        
-        # 构建总结
-        summary = f"{translated_title}：{translated_abstract}"
-        
-        # 在新线程中生成并播放语音
+        """播放论文语音（使用预生成的语音文件）。"""
+        # 在新线程中播放语音
         def speech_thread():
             try:
                 import os
-                import tempfile
                 
-                # 生成语音文件
-                temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, mode='wb')
-                temp_file_path = temp_file.name
-                temp_file.close()
-                
-                logger.info(f"生成语音文件: {temp_file_path}")
-                
-                # 使用edge-tts生成语音（同步方式）
-                import subprocess
-                import sys
-                
-                # 转义命令中的特殊字符
-                escaped_summary = summary.replace('"', '\\"').replace("'", "\\'")
-                escaped_temp_path = temp_file_path.replace('\\', '\\\\')
-                
-                # 构建edge-tts命令
-                cmd = [
-                    sys.executable, "-c",
-                    f"import edge_tts; import asyncio; asyncio.run(edge_tts.Communicate('{escaped_summary}', 'zh-CN-XiaoxiaoNeural').save('{escaped_temp_path}'))"
-                ]
-                
-                logger.info(f"执行命令: {' '.join(cmd)}")
-                
-                # 执行命令
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-                
-                # 检查文件是否存在
-                if not os.path.exists(temp_file_path):
-                    logger.error(f"生成的语音文件不存在: {temp_file_path}")
-                    return
-                
-                logger.info(f"语音文件生成成功，大小: {os.path.getsize(temp_file_path)}字节")
-                
-                # 播放语音
-                self.play_audio_file(temp_file_path)
-                
-                # 删除临时文件
-                os.unlink(temp_file_path)
-                logger.info(f"临时文件已删除: {temp_file_path}")
+                # 检查是否有预生成的语音文件
+                if hasattr(self, 'pregenerated_speech') and self.current_paper_index in self.pregenerated_speech:
+                    # 使用预生成的语音文件
+                    temp_file_path = self.pregenerated_speech[self.current_paper_index]
+                    logger.info(f"使用预生成语音文件: {temp_file_path}")
+                    
+                    # 检查文件是否存在
+                    if os.path.exists(temp_file_path):
+                        logger.info(f"语音文件大小: {os.path.getsize(temp_file_path)}字节")
+                        
+                        # 播放语音
+                        self.play_audio_file(temp_file_path)
+                    else:
+                        logger.error(f"预生成的语音文件不存在: {temp_file_path}")
+                else:
+                    # 没有预生成文件，临时生成
+                    logger.info("没有预生成语音文件，临时生成")
+                    
+                    # 清理LaTeX数学标识符
+                    title = re.sub(r'\$.*?\$', '', paper["title"])
+                    abstract = re.sub(r'\$.*?\$', '', paper["abstract"])
+                    
+                    # 翻译标题和摘要
+                    translated_title = translator.translate(title)
+                    translated_abstract = translator.translate(abstract)
+                    
+                    # 构建总结
+                    summary = f"{translated_title}：{translated_abstract}"
+                    
+                    # 生成语音文件
+                    import tempfile
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, mode='wb')
+                    temp_file_path = temp_file.name
+                    temp_file.close()
+                    
+                    logger.info(f"生成临时语音文件: {temp_file_path}")
+                    
+                    # 使用edge-tts生成语音
+                    import subprocess
+                    import sys
+                    
+                    # 转义命令中的特殊字符
+                    escaped_summary = summary.replace('"', '\\"').replace("'", "\\'")
+                    escaped_temp_path = temp_file_path.replace('\\', '\\\\')
+                    
+                    # 构建edge-tts命令
+                    cmd = [
+                        sys.executable, "-c",
+                        f"import edge_tts; import asyncio; asyncio.run(edge_tts.Communicate('{escaped_summary}', 'zh-CN-XiaoxiaoNeural').save('{escaped_temp_path}'))"
+                    ]
+                    
+                    logger.info(f"执行命令: {' '.join(cmd)}")
+                    
+                    # 执行命令
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    
+                    # 检查文件是否存在
+                    if os.path.exists(temp_file_path):
+                        logger.info(f"语音文件生成成功，大小: {os.path.getsize(temp_file_path)}字节")
+                        
+                        # 播放语音
+                        self.play_audio_file(temp_file_path)
+                        
+                        # 删除临时文件
+                        os.unlink(temp_file_path)
+                        logger.info(f"临时文件已删除: {temp_file_path}")
+                    else:
+                        logger.error(f"生成的语音文件不存在: {temp_file_path}")
             except Exception as e:
                 logger.error(f"播放语音失败: {e}")
                 import traceback
@@ -865,29 +1194,119 @@ class ArxivNewsApp:
                               font=("Arial", 10, "italic"), foreground="#666666")
         tech_label.pack(pady=5)
         
-    def add_to_auto_start(self):
-        """将程序添加到Windows自动运行列表。"""
-        if os.name != 'nt':
-            return
-        
+    def add_to_auto_start(self, enable=True):
+        """将程序添加到系统自动运行列表（支持Windows和Linux）。"""
         try:
-            import winreg
+            import os
             import sys
-            
-            # 获取当前程序路径
-            exe_path = sys.executable
             script_path = os.path.abspath(__file__)
-            command = f'"{exe_path}" "{script_path}"'
             
-            # 打开注册表
-            key_path = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
-                # 添加到自动运行
-                winreg.SetValueEx(key, "ArXivNewsApp", 0, winreg.REG_SZ, command)
-                logger.info("程序已添加到Windows自动运行列表")
+            if os.name == 'nt':  # Windows系统
+                import winreg
+                
+                # 获取当前程序路径
+                exe_path = sys.executable
+                command = f'"{exe_path}" "{script_path}"'
+                
+                # 打开注册表
+                key_path = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
+                    if enable:
+                        # 添加到自动运行
+                        winreg.SetValueEx(key, "ArXivNewsApp", 0, winreg.REG_SZ, command)
+                        logger.info("程序已添加到Windows自动运行列表")
+                        return True
+                    else:
+                        # 从自动运行中移除
+                        try:
+                            winreg.DeleteValue(key, "ArXivNewsApp")
+                            logger.info("程序已从Windows自动运行列表移除")
+                            return True
+                        except FileNotFoundError:
+                            logger.info("程序不在Windows自动运行列表中")
+                            return True
+            
+            elif os.name == 'posix':  # Linux系统
+                import os
+                
+                # 获取当前用户的autostart目录
+                autostart_dir = os.path.expanduser('~/.config/autostart')
+                os.makedirs(autostart_dir, exist_ok=True)
+                
+                # 创建.desktop文件路径
+                desktop_file = os.path.join(autostart_dir, 'arxiv_news_app.desktop')
+                
+                if enable:
+                    # 创建.desktop文件
+                    with open(desktop_file, 'w') as f:
+                        f.write(f"[Desktop Entry]\n")
+                        f.write(f"Type=Application\n")
+                        f.write(f"Name=ArXiv News App\n")
+                        f.write(f"Exec={sys.executable} {script_path}\n")
+                        f.write(f"Comment=ArXiv论文新闻播报\n")
+                        f.write(f"Icon=utilities-terminal\n")
+                        f.write(f"Terminal=false\n")
+                        f.write(f"Categories=Utility;\n")
+                    logger.info("程序已添加到Linux自动运行列表")
+                    return True
+                else:
+                    # 从自动运行中移除
+                    if os.path.exists(desktop_file):
+                        os.remove(desktop_file)
+                        logger.info("程序已从Linux自动运行列表移除")
+                        return True
+                    else:
+                        logger.info("程序不在Linux自动运行列表中")
+                        return True
+            
+            else:
+                logger.warning(f"不支持的操作系统: {os.name}")
+                return False
         except Exception as e:
-            logger.error(f"添加到Windows自动运行列表失败: {e}")
-            messagebox.showerror("错误", f"添加到自动运行失败: {str(e)}")
+            logger.error(f"自动运行设置失败: {e}")
+            return False
+    
+    def is_in_auto_start(self):
+        """检查程序是否在自动运行列表中。"""
+        try:
+            import os
+            
+            if os.name == 'nt':  # Windows系统
+                import winreg
+                
+                # 打开注册表
+                key_path = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                    # 尝试获取值
+                    try:
+                        winreg.QueryValueEx(key, "ArXivNewsApp")
+                        return True
+                    except FileNotFoundError:
+                        return False
+            
+            elif os.name == 'posix':  # Linux系统
+                # 检查.desktop文件是否存在
+                desktop_file = os.path.expanduser('~/.config/autostart/arxiv_news_app.desktop')
+                return os.path.exists(desktop_file)
+            
+            else:
+                return False
+        except Exception as e:
+            logger.error(f"检查自动运行状态失败: {e}")
+            return False
+    
+    def toggle_auto_start(self):
+        """切换自动运行状态。"""
+        enable = self.auto_start_var.get()
+        success = self.add_to_auto_start(enable)
+        
+        if success:
+            status = "已添加到" if enable else "已从"
+            messagebox.showinfo("成功", f"程序{status}自动运行列表")
+        else:
+            # 恢复原来的状态
+            self.auto_start_var.set(not enable)
+            messagebox.showerror("错误", "自动运行设置失败，请检查权限")
         
     def view_favorite(self):
         """查看收藏详情，添加卡通元素和丰富的颜色。"""
@@ -983,22 +1402,38 @@ class ArxivNewsApp:
         
     def save_config(self):
         """保存配置。"""
-        # 获取配置值
+        # 获取搜索配置值
         keywords = self.keyword_entry.get().split(",")
         keywords = [k.strip() for k in keywords if k.strip()]
         
         fields = self.field_entry.get().split(",")
         fields = [f.strip() for f in fields if f.strip()]
         
+        # 获取翻译配置值
+        translator_type = self.translator_var.get()
+        baidu_app_id = self.baidu_app_id_entry.get().strip()
+        baidu_app_key = self.baidu_app_key_entry.get().strip()
+        doubao_api_key = self.doubao_api_key_entry.get().strip()
+        doubao_secret_key = self.doubao_secret_key_entry.get().strip()
+        
         # 更新配置
         CONFIG["keywords"] = keywords
         CONFIG["fields"] = fields
+        CONFIG["translation"]["type"] = translator_type
+        CONFIG["translation"]["baidu"]["app_id"] = baidu_app_id
+        CONFIG["translation"]["baidu"]["app_key"] = baidu_app_key
+        CONFIG["translation"]["doubao"]["api_key"] = doubao_api_key
+        CONFIG["translation"]["doubao"]["secret_key"] = doubao_secret_key
         
         # 保存配置到文件
         try:
             config_file = "arxiv_news_config.json"
             with open(config_file, "w", encoding="utf-8") as f:
                 json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+            
+            # 更新全局翻译器类型
+            global translator
+            translator.translator_type = translator_type
             
             messagebox.showinfo("成功", "配置已保存")
         except Exception as e:
@@ -1064,6 +1499,21 @@ class ArxivNewsApp:
             
             time.sleep(60)  # 每分钟检查一次
             
+    def on_close(self):
+        """窗口关闭事件处理，清理预生成的语音文件。"""
+        # 清理预生成的语音文件
+        if hasattr(self, 'pregenerated_speech'):
+            for speech_path in self.pregenerated_speech.values():
+                if os.path.exists(speech_path):
+                    try:
+                        os.unlink(speech_path)
+                        logger.info(f"清理预生成语音文件: {speech_path}")
+                    except Exception as e:
+                        logger.error(f"清理预生成语音文件失败: {e}")
+        
+        # 关闭窗口
+        self.root.destroy()
+    
     def run(self):
         """运行应用程序。"""
         self.root.mainloop()
