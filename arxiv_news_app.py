@@ -288,8 +288,9 @@ class ArxivNewsApp:
                         translated_title = translator.translate(title)
                         translated_abstract = translator.translate(abstract)
                         
-                        # 构建总结
-                        summary = f"{translated_title}：{translated_abstract}"
+                        # 构建总结，加上第一作者名字
+                        first_author = paper["authors"][0] if paper["authors"] else "未知作者"
+                        summary = f"{first_author}等上传文章说：{translated_title}：{translated_abstract}"
                         
                         # 生成语音文件
                         import tempfile
@@ -1005,8 +1006,9 @@ class ArxivNewsApp:
                 translated_title = translator.translate(title)
                 translated_abstract = translator.translate(abstract)
                 
-                # 构建总结
-                summary = f"{translated_title}：{translated_abstract}"
+                # 构建总结，加上第一作者名字
+                first_author = paper["authors"][0] if paper["authors"] else "未知作者"
+                summary = f"{first_author}等上传文章说：{translated_title}：{translated_abstract}"
                 
                 # 生成语音文件
                 import tempfile
@@ -1096,8 +1098,9 @@ class ArxivNewsApp:
                     translated_title = translator.translate(title)
                     translated_abstract = translator.translate(abstract)
                     
-                    # 构建总结
-                    summary = f"{translated_title}：{translated_abstract}"
+                    # 构建总结，加上第一作者名字
+                    first_author = paper["authors"][0] if paper["authors"] else "未知作者"
+                    summary = f"{first_author}等上传文章说：{translated_title}：{translated_abstract}"
                     
                     # 生成语音文件
                     import tempfile
