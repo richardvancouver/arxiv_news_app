@@ -1,0 +1,1 @@
+use edge-tts == 7.2.1, other versions of edge-tts might cause malfunction
